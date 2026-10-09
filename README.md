@@ -41,8 +41,17 @@ Clients must use the canonical names below when creating commitments, because th
 
 ## Signed messages
 
-NEP-413 payload with `recipient: "recover"`, where the message is `NEAR recovery: <action> <0u account> commitment <hex>`
-and `<action>` is `register on v<N>`, `update` or `upgrade to v<N>`.
+The message is `NEAR recovery: <action> <0u account> commitment <hex>`, where `<action>` is `register on v<N>`, `update` or `upgrade to v<N>`.
+The message names the instance account, which binds it to `K` and to this registry. The optional `format` field says how a wallet wrapped the message before signing:
+
+| `format` | Wallets | Schemes | Signed bytes |
+|---|---|---|---|
+| `nep413` (default) | NEAR | all | NEP-413 payload, `recipient: "recover"`, requires `nonce` |
+| `eip191` | Ethereum (`personal_sign`) | `secp256k1` | `keccak256("\x19Ethereum Signed Message:\n" ‖ len ‖ msg)`, signature `r ‖ s ‖ v` |
+| `bitcoin` | Bitcoin (BIP-137 signed message) | `secp256k1` | `sha256d("\x18Bitcoin Signed Message:\n" ‖ len ‖ msg)`, signature `header ‖ r ‖ s` |
+| `raw` | Solana (`signMessage`) for `ed25519`; any tool that signs plain bytes for `ml-dsa-65` | `ed25519`, `ml-dsa-65` | the message itself |
+
+A signature made for one format doesn't verify under another. Bitcoin Taproot (BIP-322, Schnorr) isn't supported, because NEAR has no host function for Schnorr verification.
 
 ## Versions
 

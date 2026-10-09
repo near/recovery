@@ -351,6 +351,40 @@ fn rotation(account: &AccountId, action: &str, r: &SecretKey, next: &str) -> Val
     json!({"revealed": enc(&r.public_key()), "commitment": next, "nonce": nonce, "signature": signature})
 }
 
+/// Signs `message` the way a wallet of `format` does: `{signature, format}`.
+fn sign_wallet(sk: &SecretKey, message: &str, format: &str) -> Value {
+    let msg = message.as_bytes();
+    let raw = |sig: near_crypto::Signature| borsh::to_vec(&sig).unwrap()[1..].to_vec();
+    let sig: Vec<u8> = match format {
+        "eip191" => {
+            let digest: [u8; 32] = sha3::Keccak256::digest(
+                [b"\x19Ethereum Signed Message:\n", msg.len().to_string().as_bytes(), msg].concat(),
+            )
+            .into();
+            let mut sig = raw(sk.sign(&digest));
+            sig[64] += 27; // wallets output v = 27 | 28
+            sig
+        }
+        "bitcoin" => {
+            let digest = sha256(&sha256(&[b"\x18Bitcoin Signed Message:\n", &[msg.len() as u8][..], msg].concat()));
+            let sig = raw(sk.sign(&digest));
+            // header = 27 + recovery id + 4 (compressed P2PKH), then r ‖ s.
+            [&[31 + sig[64]][..], &sig[..64]].concat()
+        }
+        "raw" => raw(sk.sign(msg)),
+        _ => unreachable!(),
+    };
+    json!({"signature": format!("{}:{}", sk.key_type(), B64.encode(sig)), "format": format})
+}
+
+/// Registration signed for v0 by a wallet of `format`.
+fn register_wallet(account: &AccountId, k: &SecretKey, c: &str, format: &str) -> Value {
+    let mut args = sign_wallet(k, &format!("NEAR recovery: register on v0 {account} commitment {c}"), format);
+    args["key"] = json!(enc(&k.public_key()));
+    args["commitment"] = json!(c);
+    args
+}
+
 fn recover_args(r: &Raw) -> Value {
     json!({"revealed": r.enc()})
 }
@@ -407,6 +441,7 @@ fn registry_e2e() {
     commit_only_schemes(&sb);
     upgrades(&sb);
     rejections(&sb);
+    wallet_formats(&sb);
 }
 
 /// register → update → recover → re-register, with `K` of `k_type` and recovery keys of `r_type`.
@@ -657,4 +692,59 @@ fn rejections(sb: &Sandbox) {
     assert_err(sb.send(&sb.relayer, &account, vec![call("update", args)]), "invalid key length");
     let huge = Raw("ml-dsa-87".into(), vec![1; 8193]);
     assert_err(sb.send(&sb.relayer, &account, vec![call("recover", recover_args(&huge))]), "key too long");
+}
+
+/// Ethereum (EIP-191), Bitcoin (BIP-137) and Solana (raw ed25519) wallets.
+fn wallet_formats(sb: &Sandbox) {
+    println!("--- wallet formats");
+    for (k_type, format) in [(KeyType::SECP256K1, "eip191"), (KeyType::SECP256K1, "bitcoin"), (KeyType::ED25519, "raw")] {
+        let k = SecretKey::from_random(k_type);
+        let r1 = SecretKey::from_random(k_type);
+        let r2 = SecretKey::from_random(KeyType::MLDSA65);
+        let account = account_of(&k.public_key());
+        let (c1, c2) = (commitment(&r1.public_key()), commitment(&r2.public_key()));
+
+        // The same signature presented as another format does not verify.
+        let mut other = register_wallet(&account, &k, &c1, format);
+        other["format"] = json!(if format == "eip191" { "bitcoin" } else if format == "bitcoin" { "eip191" } else { "nep413" });
+        other["nonce"] = json!(B64.encode([0u8; 32]));
+        let res = sb.send(&sb.relayer, &account, vec![init(&k.public_key()), call("register", other)]);
+        assert!(res.is_err(), "{format}: signature accepted under another format");
+
+        let out = sb.send(&sb.relayer, &account, vec![init(&k.public_key()), call("register", register_wallet(&account, &k, &c1, format))]).unwrap();
+        println!("register ({format}): {} Tgas", out.gas_burnt / 10u64.pow(12));
+        assert_eq!(sb.view(&account, "get")["commitment"], c1);
+
+        // The committed key signs a rotation with the same kind of wallet.
+        let mut args = sign_wallet(&r1, &format!("NEAR recovery: update {account} commitment {c2}"), format);
+        args["revealed"] = json!(enc(&r1.public_key()));
+        args["commitment"] = json!(c2);
+        sb.send(&sb.relayer, &account, vec![call("update", args)]).unwrap();
+        assert_eq!(sb.view(&account, "get")["commitment"], c2);
+    }
+
+    let secp = SecretKey::from_random(KeyType::SECP256K1);
+    let ed = SecretKey::from_random(KeyType::ED25519);
+    let c = commitment(&ed.public_key());
+
+    // Formats are tied to schemes: no raw secp256k1, no EIP-191 ed25519.
+    let account = account_of(&secp.public_key());
+    let mut args = register_wallet(&account, &secp, &c, "eip191");
+    args["format"] = json!("raw");
+    assert_err(sb.send(&sb.relayer, &account, vec![init(&secp.public_key()), call("register", args)]), "format does not support this scheme");
+    let account = account_of(&ed.public_key());
+    let mut args = register_wallet(&account, &ed, &c, "raw");
+    args["format"] = json!("eip191");
+    assert_err(sb.send(&sb.relayer, &account, vec![init(&ed.public_key()), call("register", args)]), "format does not support this scheme");
+
+    // NEP-413 requires a nonce; recovery ids outside the format's range fail.
+    let mut args = register_wallet(&account, &ed, &c, "raw");
+    args["format"] = json!("nep413");
+    assert_err(sb.send(&sb.relayer, &account, vec![init(&ed.public_key()), call("register", args)]), "nep413 requires a 32-byte nonce");
+    let account = account_of(&secp.public_key());
+    let mut args = register_wallet(&account, &secp, &c, "eip191");
+    let mut sig = B64.decode(args["signature"].as_str().unwrap().split_once(':').unwrap().1).unwrap();
+    sig[64] = 29;
+    args["signature"] = json!(format!("secp256k1:{}", B64.encode(sig)));
+    assert_err(sb.send(&sb.relayer, &account, vec![init(&secp.public_key()), call("register", args)]), "invalid recovery id");
 }

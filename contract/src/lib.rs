@@ -9,8 +9,9 @@
 //! travel as `"<scheme>:<base64>"`. Signatures are verified for [`VERIFIABLE`]
 //! schemes only; `recover` reveals a key of any scheme.
 //!
-//! Signatures are NEP-413 payloads with `recipient = "recover"`. Messages name
-//! the instance account, which binds them to `K`.
+//! Signatures cover `NEAR recovery: <action> <this account> commitment <hex>`
+//! in one of the [`Format`]s; NEP-413 (`recipient = "recover"`) by default. The
+//! message names the instance account, which binds it to `K` and this registry.
 //!
 //! Versions are immutable global contracts at `v<N>.recover`. An instance moves
 //! to a newer version via [`Registry::upgrade`], which switches code and calls
@@ -64,8 +65,10 @@ pub struct Entry {
 pub struct Registration {
     pub key: String,
     pub commitment: String,
-    pub nonce: Base64VecU8,
     pub signature: String,
+    /// Required for NEP-413 only.
+    pub nonce: Option<Base64VecU8>,
+    pub format: Option<Format>,
 }
 
 /// Rotation to a new commitment, signed by the currently committed key `R`.
@@ -73,8 +76,27 @@ pub struct Registration {
 pub struct Rotation {
     pub revealed: String,
     pub commitment: String,
-    pub nonce: Base64VecU8,
     pub signature: String,
+    /// Required for NEP-413 only.
+    pub nonce: Option<Base64VecU8>,
+    pub format: Option<Format>,
+}
+
+/// How the message is wrapped before signing, so existing wallets can sign it.
+#[near(serializers = [json])]
+#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum Format {
+    /// NEP-413 `signMessage`: NEAR wallets. Any scheme.
+    #[default]
+    Nep413,
+    /// EIP-191 `personal_sign`: Ethereum wallets. secp256k1, signature `r ‖ s ‖ v`.
+    Eip191,
+    /// "Bitcoin Signed Message" (BIP-137): Bitcoin wallets. secp256k1, signature
+    /// `header ‖ r ‖ s` as wallets output it.
+    Bitcoin,
+    /// The message itself, e.g. Solana `signMessage`. ed25519 and ml-dsa-65.
+    Raw,
 }
 
 /// What authorizes an upgrade: registering in the new version, or rotating there.
@@ -92,23 +114,37 @@ pub struct Registry {}
 #[near]
 impl Registry {
     /// Stores the first commitment. Signed by `key`, the key this account is bound to.
-    pub fn register(key: String, commitment: String, nonce: Base64VecU8, signature: String) {
+    pub fn register(
+        key: String,
+        commitment: String,
+        signature: String,
+        nonce: Option<Base64VecU8>,
+        format: Option<Format>,
+    ) {
         register_key(Registration {
             key,
             commitment,
-            nonce,
             signature,
+            nonce,
+            format,
         });
     }
 
     /// Replaces the commitment. Signed by the currently committed key.
-    pub fn update(revealed: String, commitment: String, nonce: Base64VecU8, signature: String) {
+    pub fn update(
+        revealed: String,
+        commitment: String,
+        signature: String,
+        nonce: Option<Base64VecU8>,
+        format: Option<Format>,
+    ) {
         rotate(
             Rotation {
                 revealed,
                 commitment,
-                nonce,
                 signature,
+                nonce,
+                format,
             },
             "update",
         );
@@ -182,7 +218,8 @@ fn register_key(registration: Registration) {
     key.verify(
         &registration.signature,
         &message(&format!("register on v{VERSION}"), &registration.commitment),
-        &registration.nonce,
+        registration.nonce.as_ref(),
+        registration.format.unwrap_or_default(),
     );
     write_entry(&new, env::block_height());
 }
@@ -195,7 +232,8 @@ fn rotate(rotation: Rotation, action: &str) {
     key.verify(
         &rotation.signature,
         &message(action, &rotation.commitment),
-        &rotation.nonce,
+        rotation.nonce.as_ref(),
+        rotation.format.unwrap_or_default(),
     );
     write_entry(&new, registered_at);
 }
@@ -243,8 +281,8 @@ impl Key {
         format!("{}:{}", self.scheme, BASE64.encode(&self.raw))
     }
 
-    /// Verifies `signature` (`"<scheme>:<base64>"`) over the NEP-413 hash of `message`.
-    fn verify(&self, signature: &str, message: &str, nonce: &Base64VecU8) {
+    /// Verifies `signature` (`"<scheme>:<base64>"`) over `message` wrapped in `format`.
+    fn verify(&self, signature: &str, message: &str, nonce: Option<&Base64VecU8>, format: Format) {
         let &(_, key_len, sig_len) = VERIFIABLE
             .iter()
             .find(|v| v.0 == self.scheme)
@@ -253,21 +291,67 @@ impl Key {
         let (scheme, sig) = split(signature);
         require!(scheme == self.scheme, "signature scheme does not match key");
         require!(sig.len() == sig_len, "invalid signature length");
-        let nonce: [u8; 32] = nonce.0[..]
-            .try_into()
-            .unwrap_or_else(|_| env::panic_str("nonce must be 32 bytes"));
-        let payload =
-            borsh::to_vec(&(NEP413_TAG, message, nonce, REGISTRY, None::<String>)).unwrap();
-        let hash = env::sha256_array(&payload);
+        let secp = scheme == "secp256k1";
+        require!(
+            match format {
+                Format::Nep413 => true,
+                Format::Eip191 | Format::Bitcoin => secp,
+                Format::Raw => !secp,
+            },
+            "format does not support this scheme"
+        );
+
+        let msg = message.as_bytes();
+        let signed: Vec<u8> = match format {
+            Format::Nep413 => {
+                let nonce: [u8; 32] = nonce
+                    .and_then(|n| n.0[..].try_into().ok())
+                    .unwrap_or_else(|| env::panic_str("nep413 requires a 32-byte nonce"));
+                let payload =
+                    borsh::to_vec(&(NEP413_TAG, message, nonce, REGISTRY, None::<String>)).unwrap();
+                env::sha256_array(payload).to_vec()
+            }
+            Format::Eip191 => env::keccak256_array(
+                [
+                    b"\x19Ethereum Signed Message:\n",
+                    msg.len().to_string().as_bytes(),
+                    msg,
+                ]
+                .concat(),
+            )
+            .to_vec(),
+            Format::Bitcoin => {
+                // varint(len): messages here are far below 0xfd bytes.
+                require!(msg.len() < 0xfd, "message too long");
+                let data = [
+                    b"\x18Bitcoin Signed Message:\n",
+                    &[msg.len() as u8][..],
+                    msg,
+                ]
+                .concat();
+                env::sha256_array(env::sha256_array(data)).to_vec()
+            }
+            Format::Raw => msg.to_vec(),
+        };
+
         let pk = &self.raw[..];
         let ok = match scheme.as_str() {
             "ed25519" => {
-                env::ed25519_verify(sig[..].try_into().unwrap(), hash, pk.try_into().unwrap())
+                env::ed25519_verify(sig[..].try_into().unwrap(), &signed, pk.try_into().unwrap())
             }
             "secp256k1" => {
-                env::ecrecover(&hash, &sig[..64], sig[64], true).is_some_and(|r| r[..] == *pk)
+                // NEAR and Ethereum: r ‖ s ‖ v, v in {0, 1} or {27, 28}.
+                // Bitcoin: header ‖ r ‖ s, header 27..=42 encodes v and the address type.
+                let (rs, v) = match (format, sig[0], sig[64]) {
+                    (Format::Bitcoin, h @ 27..=42, _) => (&sig[1..], (h - 27) & 3),
+                    (Format::Nep413 | Format::Eip191, _, v @ (0 | 1 | 27 | 28)) => {
+                        (&sig[..64], v % 27)
+                    }
+                    _ => env::panic_str("invalid recovery id"),
+                };
+                env::ecrecover(&signed, rs, v, true).is_some_and(|r| r[..] == *pk)
             }
-            _ => ml_dsa_verify(&sig, &hash, pk),
+            _ => ml_dsa_verify(&sig, &signed, pk),
         };
         require!(ok, "invalid signature");
     }
