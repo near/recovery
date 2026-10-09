@@ -470,6 +470,9 @@ fn commit_only_schemes(sb: &Sandbox) {
         ("lms", 60),
         ("xmss", 68),
         ("xmssmt", 52),
+        // Not a canonical name: the contract cannot see it at registration, so
+        // it must still be revealable rather than stuck forever.
+        ("ml-dsa87", 2592),
     ] {
         let k = SecretKey::from_random(KeyType::ED25519);
         let account = account_of(&k.public_key());
@@ -582,10 +585,11 @@ fn rejections(sb: &Sandbox) {
 
     // Malformed keys.
     for (bad, needle) in [
-        ("ml-dsa86:AAAA", "unknown scheme"),
+        ("ML-DSA-65:AAAA", "invalid scheme name"),
+        ("ed\"25519:AAAA", "invalid scheme name"),
+        (":AAAA", "invalid scheme name"),
         ("ed25519", "expected <scheme>:<base64>"),
         ("ed25519:!!", "invalid base64"),
-        ("ed25519:AAAA", "invalid key length"),
     ] {
         let mut args = register_args(&account, &k, &c);
         args["key"] = json!(bad);
@@ -643,4 +647,14 @@ fn rejections(sb: &Sandbox) {
         sb.send(&sb.relayer, &account, vec![call("recover", recover_args(&wrong_scheme))]),
         "revealed key does not match commitment",
     );
+
+    // Keys too long to reveal, and verifiable schemes with the wrong length.
+    let k = SecretKey::from_random(KeyType::ED25519);
+    let account = account_of(&k.public_key());
+    let short = Raw("ed25519".into(), vec![7; 31]);
+    sb.send(&sb.relayer, &account, vec![init(&k.public_key()), call("register", register_args(&account, &k, &short.commitment()))]).unwrap();
+    let args = json!({"revealed": short.enc(), "commitment": c, "nonce": B64.encode([0u8; 32]), "signature": "ed25519:AA=="});
+    assert_err(sb.send(&sb.relayer, &account, vec![call("update", args)]), "invalid key length");
+    let huge = Raw("ml-dsa-87".into(), vec![1; 8193]);
+    assert_err(sb.send(&sb.relayer, &account, vec![call("recover", recover_args(&huge))]), "key too long");
 }

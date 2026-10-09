@@ -1,6 +1,6 @@
 # NEAR Recovery Registry
 
-Commit today, from any NEAR key `K`, to a hidden recovery key `R`. If `K`'s
+Commit today, from any key `K`, to a hidden recovery key `R`. If `K`'s
 cryptography breaks later (quantum or classical), the commitment, signed while
 only the owner held `K`, still identifies the true owner.
 
@@ -11,7 +11,7 @@ only the owner held `K`, still identifies the true owner.
 Each key `K` has exactly one registry account, a `0u` (NEP-655) account derived from the **v0** init:
 
 ```
-id(K) = 0u…( UniversalStateInit::V1 { code: AccountId("v0.recover"), data: {"k": hash(K)}, access_keys: {} } )
+id(K) = 0u...( UniversalStateInit::V1 { code: AccountId("v0.recover"), data: {"k": hash(K)}, access_keys: {} } )
 hash(key) = sha256("<scheme>:" ‖ raw key bytes)
 ```
 
@@ -19,15 +19,25 @@ hash(key) = sha256("<scheme>:" ‖ raw key bytes)
 - **update:** the committed `R` signs a new commitment. `K` can never change anything.
 - **recover:** reveal `R`. No signature is needed, because R's authority is exercised by whoever consumes the record. It emits an event and deletes the account.
 
-The design has no cross-contract calls, no storage deposit (zero-balance accounts), and spreads across all shards automatically.
+The design has no cross-contract calls, no storage deposit (zero-balance accounts), and spreads across shards automatically.
 
 ## Schemes
 
-| Can sign on-chain (`K`, or `R` in update/upgrade) | Commit and reveal only (`R`) |
-|---|---|
-| `ed25519`, `secp256k1`, `ml-dsa-65` | `ml-dsa-44`, `ml-dsa-87`, `slh-dsa-{sha2,shake}-{128s,256s}`, `fn-dsa-{512,1024}`, `lms`, `xmss`, `xmssmt` |
+Keys and signatures are passed as `"<scheme>:<base64>"`. The contract never sees a commitment's scheme: it only receives the hash. It checks scheme names only on keys that are passed in clear.
 
-Keys and signatures are passed as `"<scheme>:<base64>"`. Unknown schemes and wrong lengths are rejected.
+- **Verified on-chain:** `ed25519`, `secp256k1`, `ml-dsa-65`. These are the schemes `K` can use and `R` can sign with in update and upgrade. The contract checks their key and signature lengths.
+- **Revealed by `recover`:** any scheme named `[a-z0-9-]{1,32}` with a key up to 8 KiB. Revealing is just showing a preimage, so a nonstandard name must never make a commitment unrevealable.
+
+Clients must use the canonical names below when creating commitments, because that's the only place a misspelling can be caught:
+
+| Scheme | Public key (bytes) |
+|---|---|
+| `ed25519` / `secp256k1` / `ml-dsa-65` | 32 / 64 / 1952 |
+| `ml-dsa-44` / `ml-dsa-87` | 1312 / 2592 |
+| `slh-dsa-{sha2,shake}-128s` / `slh-dsa-{sha2,shake}-256s` | 32 / 64 |
+| `fn-dsa-512` / `fn-dsa-1024` | 897 / 1793 |
+| `lms` (HSS, RFC 8554) | 52 or 60 |
+| `xmss` / `xmssmt` (RFC 8391) | 52 or 68 |
 
 ## Signed messages
 
@@ -40,7 +50,7 @@ and `<action>` is `register on v<N>`, `update` or `upgrade to v<N>`.
 - `upgrade(N, auth)` makes the instance switch its own code to `v<N>.recover` and call the new version's `migrate` in the **same receipt**. If `migrate` fails, the switch is rolled back. Every upgrade is authorized and **verified by the new version**:
   - An empty instance registers there, signed by `K` for `register on v<N>`. New users join any version in one transaction, `[init(v0), upgrade(N, register)]`, and nobody else can choose the version for someone else's key.
   - A registered instance rotates there, signed by `R` for `upgrade to v<N>`. Schemes that only later versions can verify are therefore usable, and revealing `R` always comes with a fresh commitment.
-- **Lock:** once the DAO stops publishing versions, the set of versions is final. DAO keys are ECC too.
+- **Lock:** once the DAO stops publishing versions, the set of versions is final. DAO keys can be broken too.
 
 ## Rules for consumers
 
@@ -54,7 +64,6 @@ and `<action>` is `register on v<N>`, `update` or `upgrade to v<N>`.
 
 - A ZK proof of knowing `R` instead of revealing it, to stop mempool front-running of update and upgrade when `R` is an ECC key.
 - On-chain verification of the commit-only schemes, in later versions.
-- Cross-chain `K` (e.g. Ethereum addresses).
 
 ## Build and test
 

@@ -5,8 +5,9 @@
 //! The instance stores at most one entry: a commitment `hash(R)` to a recovery
 //! key `R` and the block height of the original registration.
 //!
-//! `hash(key) = sha256("<scheme>:" ‖ raw key bytes)` for a scheme from [`SCHEMES`].
-//! Keys and signatures travel as `"<scheme>:<base64>"`.
+//! `hash(key) = sha256("<scheme>:" ‖ raw key bytes)`. Keys and signatures
+//! travel as `"<scheme>:<base64>"`. Signatures are verified for [`VERIFIABLE`]
+//! schemes only; `recover` reveals a key of any scheme.
 //!
 //! Signatures are NEP-413 payloads with `recipient = "recover"`. Messages name
 //! the instance account, which binds them to `K`.
@@ -37,27 +38,18 @@ const NEP413_TAG: u32 = (1 << 31) + 413;
 /// Entry: `commitment (32) ‖ registered_at (u64 LE)`.
 const ENTRY: &[u8] = b"c";
 
-/// Scheme name, accepted public key lengths, and signature length if this
-/// version verifies the scheme on-chain. Other schemes can only be committed
-/// to and revealed.
-const SCHEMES: &[(&str, &[usize], Option<usize>)] = &[
-    ("ed25519", &[32], Some(64)),
-    ("secp256k1", &[64], Some(65)),
-    ("ml-dsa-65", &[1952], Some(3309)),
-    ("ml-dsa-44", &[1312], None),
-    ("ml-dsa-87", &[2592], None),
-    ("slh-dsa-sha2-128s", &[32], None),
-    ("slh-dsa-shake-128s", &[32], None),
-    ("slh-dsa-sha2-256s", &[64], None),
-    ("slh-dsa-shake-256s", &[64], None),
-    ("fn-dsa-512", &[897], None),
-    ("fn-dsa-1024", &[1793], None),
-    // HSS/LMS (RFC 8554, SP 800-208): u32 levels ‖ LMS public key, n = 24 | 32.
-    ("lms", &[52, 60], None),
-    // XMSS / XMSS^MT (RFC 8391, SP 800-208): u32 OID ‖ root ‖ seed, n = 24 | 32.
-    ("xmss", &[52, 68], None),
-    ("xmssmt", &[52, 68], None),
+/// Schemes this version verifies on-chain: name, public key length, signature
+/// length. Any other `<scheme>` can still be committed to and revealed; the
+/// contract never sees a commitment's scheme, so canonical names are a client
+/// concern (see README).
+const VERIFIABLE: &[(&str, usize, usize)] = &[
+    ("ed25519", 32, 64),
+    ("secp256k1", 64, 65),
+    ("ml-dsa-65", 1952, 3309),
 ];
+/// Bounds for any `"<scheme>:<base64>"`: scheme `[a-z0-9-]{1,32}`, bytes ≤ 8 KiB.
+const MAX_SCHEME_LEN: usize = 32;
+const MAX_KEY_LEN: usize = 8192;
 
 #[near(serializers = [json])]
 pub struct Entry {
@@ -230,36 +222,34 @@ fn message(action: &str, commitment: &str) -> String {
 }
 
 struct Key {
-    scheme: usize,
+    scheme: String,
     raw: Vec<u8>,
 }
 
 impl Key {
-    /// Parses `"<scheme>:<base64>"` for a scheme from [`SCHEMES`].
+    /// Parses `"<scheme>:<base64>"` of any scheme: revealing is just showing a preimage.
     fn parse(s: &str) -> Self {
         let (scheme, raw) = split(s);
-        require!(SCHEMES[scheme].1.contains(&raw.len()), "invalid key length");
+        require!(raw.len() <= MAX_KEY_LEN, "key too long");
         Self { scheme, raw }
-    }
-
-    fn name(&self) -> &'static str {
-        SCHEMES[self.scheme].0
     }
 
     /// `sha256("<scheme>:" ‖ raw)`
     fn hash(&self) -> [u8; 32] {
-        env::sha256_array([self.name().as_bytes(), b":", &self.raw].concat())
+        env::sha256_array([self.scheme.as_bytes(), b":", &self.raw].concat())
     }
 
     fn canonical(&self) -> String {
-        format!("{}:{}", self.name(), BASE64.encode(&self.raw))
+        format!("{}:{}", self.scheme, BASE64.encode(&self.raw))
     }
 
     /// Verifies `signature` (`"<scheme>:<base64>"`) over the NEP-413 hash of `message`.
     fn verify(&self, signature: &str, message: &str, nonce: &Base64VecU8) {
-        let sig_len = SCHEMES[self.scheme]
-            .2
+        let &(_, key_len, sig_len) = VERIFIABLE
+            .iter()
+            .find(|v| v.0 == self.scheme)
             .unwrap_or_else(|| env::panic_str("scheme cannot be verified on-chain"));
+        require!(self.raw.len() == key_len, "invalid key length");
         let (scheme, sig) = split(signature);
         require!(scheme == self.scheme, "signature scheme does not match key");
         require!(sig.len() == sig_len, "invalid signature length");
@@ -270,7 +260,7 @@ impl Key {
             borsh::to_vec(&(NEP413_TAG, message, nonce, REGISTRY, None::<String>)).unwrap();
         let hash = env::sha256_array(&payload);
         let pk = &self.raw[..];
-        let ok = match self.name() {
+        let ok = match scheme.as_str() {
             "ed25519" => {
                 env::ed25519_verify(sig[..].try_into().unwrap(), hash, pk.try_into().unwrap())
             }
@@ -283,19 +273,22 @@ impl Key {
     }
 }
 
-/// Splits `"<scheme>:<base64>"` into the scheme index and decoded bytes.
-fn split(s: &str) -> (usize, Vec<u8>) {
-    let (name, data) = s
+/// Splits `"<scheme>:<base64>"` into the scheme name and decoded bytes.
+fn split(s: &str) -> (String, Vec<u8>) {
+    let (scheme, data) = s
         .split_once(':')
         .unwrap_or_else(|| env::panic_str("expected <scheme>:<base64>"));
-    let scheme = SCHEMES
-        .iter()
-        .position(|s| s.0 == name)
-        .unwrap_or_else(|| env::panic_str("unknown scheme"));
+    require!(
+        (1..=MAX_SCHEME_LEN).contains(&scheme.len())
+            && scheme
+                .bytes()
+                .all(|c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'-')),
+        "invalid scheme name"
+    );
     let raw = BASE64
         .decode(data)
         .unwrap_or_else(|_| env::panic_str("invalid base64"));
-    (scheme, raw)
+    (scheme.to_owned(), raw)
 }
 
 /// Account derived from the v0 init for a key with hash `k`: every key has
