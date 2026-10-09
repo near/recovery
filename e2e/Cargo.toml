@@ -1,0 +1,19 @@
+[package]
+name = "recover-e2e"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "End-to-end tests for the recovery registry against a local sandbox neard (protocol v87)"
+
+# Separate from the contract workspace: it builds with nearcore's toolchain and
+# path dependencies, while the contract builds with Rust 1.86 for wasm.
+[workspace]
+
+[dependencies]
+base64 = "0.22"
+borsh = "1"
+near-crypto = { path = "../../nearcore/core/crypto", features = ["rand"] }
+near-primitives = { path = "../../nearcore/core/primitives", features = ["test_utils"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
