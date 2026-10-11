@@ -1,15 +1,16 @@
 //! Recovery commitment registry.
 //!
 //! Every registered key `K` has exactly one instance: the `0u` account derived
-//! from the v0 init `{code: v0.recover, data: {"k": hash(K)}, access_keys: {}}`.
-//! The instance stores at most one entry: a commitment `hash(R)` to a recovery
-//! key `R` and the block height of the original registration.
+//! from the v0 init `{code: v0.recover, data: {"k": sha3_512(K)}, access_keys: {}}`.
+//! The instance stores at most one entry: a commitment `<hash>:<hex>` to a
+//! recovery key `R` and the block height of the original registration.
 //!
-//! `hash(key) = sha256("<scheme>:" ‖ raw key bytes)`. Keys and signatures
-//! travel as `"<scheme>:<base64>"`. Signatures are verified for [`VERIFIABLE`]
-//! schemes only; `recover` reveals a key of any scheme.
+//! A key's preimage is `"<scheme>:" ‖ raw key bytes`. Keys and signatures travel
+//! as `"<scheme>:<base64>"`. Signatures are verified for [`VERIFIABLE`] schemes
+//! only; `recover` reveals a key of any scheme. Commitments name their hash
+//! function (see [`HASHES`]), so any later version can verify a reveal.
 //!
-//! Signatures cover `NEAR recovery: <action> <this account> commitment <hex>`
+//! Signatures cover `NEAR recovery: <action> <this account> commitment <hash>:<hex>`
 //! in one of the [`Format`]s; NEP-413 (`recipient = "recover"`) by default. The
 //! message names the instance account, which binds it to `K` and this registry.
 //!
@@ -36,8 +37,19 @@ const VERSION: u32 = match option_env!("RECOVER_VERSION") {
 /// NEP-413 off-chain message prefix tag (NEP-461): `2^31 + 413`.
 const NEP413_TAG: u32 = (1 << 31) + 413;
 
-/// Entry: `commitment (32) ‖ registered_at (u64 LE)`.
+/// Entry: borsh `(hash name, digest, registered_at)`.
 const ENTRY: &[u8] = b"c";
+
+/// Hash functions for commitments: name and digest length. Every version must
+/// keep every hash any version ever accepted, so stored commitments stay
+/// revealable; it may stop accepting new commitments under a broken one.
+#[cfg(not(feature = "test-hash"))]
+const HASHES: &[(&str, usize)] = &[("sha3-512", 64)];
+/// Test builds add SHA3-384 to exercise rotating into another hash.
+#[cfg(feature = "test-hash")]
+const HASHES: &[(&str, usize)] = &[("sha3-512", 64), ("sha3-384", 48)];
+/// Hash of `K` in the init data. Fixed: it is part of every canonical account id.
+const KEY_HASH: &str = "sha3-512";
 
 /// Schemes this version verifies on-chain: name, public key length, signature
 /// length. Any other `<scheme>` can still be committed to and revealed; the
@@ -54,7 +66,7 @@ const MAX_KEY_LEN: usize = 8192;
 
 #[near(serializers = [json])]
 pub struct Entry {
-    /// Hex `hash(R)`.
+    /// `<hash>:<hex>` of `R`'s preimage.
     pub commitment: String,
     /// Block height of the original registration, kept across updates.
     pub registered_at: u64,
@@ -154,10 +166,12 @@ impl Registry {
     /// balance to the caller. Knowing the preimage is enough: the recovery key's
     /// authority is exercised by whoever consumes the record.
     pub fn recover(revealed: String) -> Promise {
+        let entry = read_entry();
         let (key, registered_at) = reveal(&revealed);
         env::log_str(&format!(
-            r#"EVENT_JSON:{{"standard":"recover","version":"1.0.0","event":"recover","data":{{"revealed":"{}","registered_at":{registered_at}}}}}"#,
-            key.canonical()
+            r#"EVENT_JSON:{{"standard":"recover","version":"1.0.0","event":"recover","data":{{"revealed":"{}","commitment":"{}","registered_at":{registered_at}}}}}"#,
+            key.canonical(),
+            entry.unwrap().0
         ));
         Promise::new(env::current_account_id()).delete_account(env::predecessor_account_id())
     }
@@ -194,7 +208,7 @@ impl Registry {
 
     pub fn get() -> Option<Entry> {
         read_entry().map(|(commitment, registered_at)| Entry {
-            commitment: to_hex(&commitment),
+            commitment: commitment.to_string(),
             registered_at,
         })
     }
@@ -210,11 +224,11 @@ impl Registry {
 fn register_key(registration: Registration) {
     let key = Key::parse(&registration.key);
     require!(
-        env::current_account_id() == canonical_account(&key.hash()),
+        env::current_account_id() == canonical_account(&key.digest(KEY_HASH)),
         "not the canonical account for this key"
     );
     require!(env::storage_read(ENTRY).is_none(), "already registered");
-    let new = parse_hex32(&registration.commitment);
+    let new = Commitment::parse(&registration.commitment);
     key.verify(
         &registration.signature,
         &message(&format!("register on v{VERSION}"), &registration.commitment),
@@ -228,7 +242,7 @@ fn register_key(registration: Registration) {
 /// its new commitment, keeping the original registration height.
 fn rotate(rotation: Rotation, action: &str) {
     let (key, registered_at) = reveal(&rotation.revealed);
-    let new = parse_hex32(&rotation.commitment);
+    let new = Commitment::parse(&rotation.commitment);
     key.verify(
         &rotation.signature,
         &message(action, &rotation.commitment),
@@ -245,13 +259,13 @@ fn reveal(revealed: &str) -> (Key, u64) {
         read_entry().unwrap_or_else(|| env::panic_str("not registered"));
     let key = Key::parse(revealed);
     require!(
-        key.hash() == commitment,
+        key.digest(&commitment.hash) == commitment.digest,
         "revealed key does not match commitment"
     );
     (key, registered_at)
 }
 
-/// `NEAR recovery: <action> <this account> commitment <hex>`
+/// `NEAR recovery: <action> <this account> commitment <hash>:<hex>`
 fn message(action: &str, commitment: &str) -> String {
     format!(
         "NEAR recovery: {action} {} commitment {commitment}",
@@ -272,9 +286,9 @@ impl Key {
         Self { scheme, raw }
     }
 
-    /// `sha256("<scheme>:" ‖ raw)`
-    fn hash(&self) -> [u8; 32] {
-        env::sha256_array([self.scheme.as_bytes(), b":", &self.raw].concat())
+    /// `hash("<scheme>:" ‖ raw)`
+    fn digest(&self, hash: &str) -> Vec<u8> {
+        digest(hash, &[self.scheme.as_bytes(), b":", &self.raw].concat())
     }
 
     fn canonical(&self) -> String {
@@ -377,7 +391,7 @@ fn split(s: &str) -> (String, Vec<u8>) {
 
 /// Account derived from the v0 init for a key with hash `k`: every key has
 /// exactly one instance, whatever version it runs now.
-fn canonical_account(k: &[u8; 32]) -> AccountId {
+fn canonical_account(k: &[u8]) -> AccountId {
     // borsh(UniversalStateInit::V1 { code: Some(GlobalContractIdentifier::AccountId(v0.recover)),
     //                                data: {"k": k}, access_keys: {} })
     let init = borsh::to_vec(&(
@@ -390,35 +404,57 @@ fn canonical_account(k: &[u8; 32]) -> AccountId {
     universal_account_id(&init)
 }
 
-fn parse_hex32(s: &str) -> [u8; 32] {
-    // Lowercase only, so the hex string signed in the message is canonical.
-    let nibble = |c: u8| match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        _ => env::panic_str("commitment must be 64 lowercase hex chars"),
-    };
-    require!(s.len() == 64, "commitment must be 64 lowercase hex chars");
-    let b = s.as_bytes();
-    std::array::from_fn(|i| nibble(b[2 * i]) << 4 | nibble(b[2 * i + 1]))
+/// `<hash>:<hex digest>`
+struct Commitment {
+    hash: String,
+    digest: Vec<u8>,
 }
 
-fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+impl Commitment {
+    /// Parses a new commitment under a hash this version accepts. Lowercase hex
+    /// only, so the string signed in the message is canonical.
+    fn parse(s: &str) -> Self {
+        let (hash, hex) = s
+            .split_once(':')
+            .unwrap_or_else(|| env::panic_str("expected <hash>:<hex>"));
+        let &(_, len) = HASHES
+            .iter()
+            .find(|h| h.0 == hash)
+            .unwrap_or_else(|| env::panic_str("unsupported hash"));
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => env::panic_str("commitment must be lowercase hex"),
+        };
+        require!(hex.len() == 2 * len, "invalid commitment length");
+        let digest = hex
+            .as_bytes()
+            .chunks(2)
+            .map(|p| nibble(p[0]) << 4 | nibble(p[1]))
+            .collect();
+        Self {
+            hash: hash.to_owned(),
+            digest,
+        }
+    }
 }
 
-fn read_entry() -> Option<([u8; 32], u64)> {
-    let v = env::storage_read(ENTRY)?;
-    Some((
-        v[..32].try_into().unwrap(),
-        u64::from_le_bytes(v[32..].try_into().unwrap()),
-    ))
+impl std::fmt::Display for Commitment {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}:", self.hash)?;
+        self.digest.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
 }
 
-fn write_entry(commitment: &[u8; 32], registered_at: u64) {
-    env::storage_write(
-        ENTRY,
-        &[&commitment[..], &registered_at.to_le_bytes()].concat(),
-    );
+fn read_entry() -> Option<(Commitment, u64)> {
+    let (hash, digest, registered_at): (String, Vec<u8>, u64) =
+        borsh::from_slice(&env::storage_read(ENTRY)?).unwrap();
+    Some((Commitment { hash, digest }, registered_at))
+}
+
+fn write_entry(commitment: &Commitment, registered_at: u64) {
+    let entry = (&commitment.hash, &commitment.digest, registered_at);
+    env::storage_write(ENTRY, &borsh::to_vec(&entry).unwrap());
 }
 
 const fn parse_u32(s: &str) -> u32 {
@@ -444,7 +480,28 @@ mod host {
             pk_ptr: u64,
         ) -> u64;
         pub fn universal_state_init_to_account_id(len: u64, ptr: u64, register_id: u64);
+        pub fn sha3_512(len: u64, ptr: u64, register_id: u64);
+        #[cfg(feature = "test-hash")]
+        pub fn sha3_384(len: u64, ptr: u64, register_id: u64);
     }
+}
+
+/// Computes `hash(data)` for a hash from [`HASHES`].
+#[cfg(target_family = "wasm")]
+fn digest(hash: &str, data: &[u8]) -> Vec<u8> {
+    let host_fn = match hash {
+        "sha3-512" => host::sha3_512,
+        #[cfg(feature = "test-hash")]
+        "sha3-384" => host::sha3_384,
+        _ => env::panic_str("unsupported hash"),
+    };
+    unsafe { host_fn(data.len() as _, data.as_ptr() as _, 0) };
+    env::read_register(0).unwrap()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn digest(_: &str, _: &[u8]) -> Vec<u8> {
+    unimplemented!("only available on-chain")
 }
 
 #[cfg(target_family = "wasm")]

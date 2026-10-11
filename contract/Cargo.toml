@@ -11,3 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 near-sdk = { version = "~5.26", features = ["unstable"] }
+
+[features]
+# Adds SHA3-384 as a second commitment hash, for e2e tests only.
+test-hash = []

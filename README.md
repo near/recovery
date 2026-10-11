@@ -11,11 +11,12 @@ only the owner held `K`, still identifies the true owner.
 Each key `K` has exactly one registry account, a `0u` (NEP-655) account derived from the **v0** init:
 
 ```
-id(K) = 0u...( UniversalStateInit::V1 { code: AccountId("v0.recover"), data: {"k": hash(K)}, access_keys: {} } )
-hash(key) = sha256("<scheme>:" ‖ raw key bytes)
+id(K) = 0u...( UniversalStateInit::V1 { code: AccountId("v0.recover"), data: {"k": sha3_512(K)}, access_keys: {} } )
+preimage(key) = "<scheme>:" ‖ raw key bytes
+commitment(R) = "<hash>:" ‖ hex(hash(preimage(R)))        e.g. sha3-512:…
 ```
 
-- **register:** `K` signs `hash(R)`, and anyone can submit it. It's stored with `registered_at = block height`.
+- **register:** `K` signs the commitment to `R`, and anyone can submit it. It's stored with `registered_at = block height`.
 - **update:** the committed `R` signs a new commitment. `K` can never change anything.
 - **recover:** reveal `R`. No signature is needed, because R's authority is exercised by whoever consumes the record. It emits an event and deletes the account.
 
@@ -39,9 +40,19 @@ Clients must use the canonical names below when creating commitments, because th
 | `lms` (HSS, RFC 8554) | 52 or 60 |
 | `xmss` / `xmssmt` (RFC 8391) | 52 or 68 |
 
+## Hashes
+
+Commitments name their hash function, and each entry stores it. Every version verifies a reveal with the hash the stored commitment names, so an instance can skip versions and still migrate in a single rotation.
+
+- v0 accepts `sha3-512`, the strongest hash NEAR provides as a host function.
+- A version that adds a new hash must keep verifying every hash any earlier version accepted. It may stop accepting *new* commitments under a broken one.
+- `k = sha3_512(K)` in the init is fixed forever, because it's part of every canonical account ID. That ID itself is SHA3-256 of the init, which the protocol fixes.
+
+The property that matters here is preimage resistance. Collision resistance doesn't, because a collision only helps whoever makes the commitment. The wallet formats keep the hashes their standards prescribe. Those hashes are only checked when the call is made, so a later version can disable a format whose hash breaks.
+
 ## Signed messages
 
-The message is `NEAR recovery: <action> <0u account> commitment <hex>`, where `<action>` is `register on v<N>`, `update` or `upgrade to v<N>`.
+The message is `NEAR recovery: <action> <0u account> commitment <hash>:<hex>`, where `<action>` is `register on v<N>`, `update` or `upgrade to v<N>`.
 The message names the instance account, which binds it to `K` and to this registry. The optional `format` field says how a wallet wrapped the message before signing:
 
 | `format` | Wallets | Schemes | Signed bytes |
@@ -63,7 +74,7 @@ A signature made for one format doesn't verify under another. Bitcoin Taproot (B
 
 ## Rules for consumers
 
-1. Derive `id(K)` yourself. Never trust another account just because its data contains `k = hash(K)`: anyone can create one with their own access keys.
+1. Derive `id(K)` yourself. Never trust another account just because its data contains `k = sha3_512(K)`: anyone can create one with their own access keys.
 2. Trust only entries whose `registered_at` predates the break.
 3. The first `recover` event for `K` is final. Re-registration after `recover` is possible but always later.
 
@@ -79,7 +90,7 @@ A signature made for one format doesn't verify under another. Bitcoin Taproot (B
 ```sh
 cd contract
 cargo near build non-reproducible-wasm --no-abi --out-dir ../target/near/v0                     # Rust 1.86
-RECOVER_VERSION=1 cargo near build non-reproducible-wasm --no-abi --out-dir ../target/near/v1   # test v1
+RECOVER_VERSION=1 cargo near build non-reproducible-wasm --no-abi --features test-hash --out-dir ../target/near/v1   # test v1
 (cd ../../nearcore && cargo build -p neard --features sandbox --profile dev-release)
 (cd ../e2e && cargo test -- --nocapture)
 ```

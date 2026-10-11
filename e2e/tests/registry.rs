@@ -6,7 +6,7 @@
 //! ```sh
 //! (cd ../nearcore && cargo build -p neard --features sandbox --profile dev-release)
 //! (cd contract && cargo near build non-reproducible-wasm --no-abi --out-dir ../target/near/v0)
-//! (cd contract && RECOVER_VERSION=1 cargo near build non-reproducible-wasm --no-abi --out-dir ../target/near/v1)
+//! (cd contract && RECOVER_VERSION=1 cargo near build non-reproducible-wasm --no-abi --features test-hash --out-dir ../target/near/v1)
 //! (cd e2e && cargo test -- --nocapture)
 //! ```
 //!
@@ -276,13 +276,18 @@ impl Raw {
         format!("{}:{}", self.0, B64.encode(&self.1))
     }
 
-    /// `sha256("<scheme>:" ‖ raw)`
-    fn hash(&self) -> [u8; 32] {
-        sha256(&[self.0.as_bytes(), b":", &self.1].concat())
+    fn preimage(&self) -> Vec<u8> {
+        [self.0.as_bytes(), b":", &self.1].concat()
     }
 
+    /// `sha3_512("<scheme>:" ‖ raw)`: the init's `k`, and the default commitment.
+    fn hash(&self) -> Vec<u8> {
+        sha3::Sha3_512::digest(self.preimage()).to_vec()
+    }
+
+    /// `sha3-512:<hex>`
     fn commitment(&self) -> String {
-        hex(&self.hash())
+        format!("sha3-512:{}", hex(&self.hash()))
     }
 }
 
@@ -581,6 +586,11 @@ fn upgrades(sb: &Sandbox) {
     assert_err(sb.send(&sb.relayer, &account, vec![upgrade(0, "rotate", ok.clone())]), "can only upgrade to a newer version");
     assert_err(sb.send(&sb.relayer, &account, vec![call("migrate", json!({"auth": {"rotate": ok.clone()}}))]), "only via upgrade");
 
+    // v0 knows only SHA3-512, so it rejects a SHA3-384 commitment.
+    let r3 = SecretKey::from_random(KeyType::MLDSA65);
+    let c3 = format!("sha3-384:{}", hex(&sha3::Sha3_384::digest(Raw::from(&r3.public_key()).preimage())));
+    assert_err(sb.send(&sb.relayer, &account, vec![call("update", rotation(&account, "update", &r1, &c3))]), "unsupported hash");
+
     // Signed by R1 for "upgrade to v1": switches code and rotates to R2.
     let out = sb.send(&sb.relayer, &account, vec![upgrade(1, "rotate", ok)]).unwrap();
     println!("upgrade+rotate:   {} Tgas", out.gas_burnt / 10u64.pow(12));
@@ -588,6 +598,13 @@ fn upgrades(sb: &Sandbox) {
     let entry = sb.view(&account, "get");
     assert_eq!(entry["commitment"], c2);
     assert_eq!(entry["registered_at"].as_u64().unwrap(), registered_at);
+
+    // Hash agility: v1 rotates from the SHA3-512 commitment into SHA3-384, and
+    // reveals use whichever hash the stored commitment names.
+    sb.send(&sb.relayer, &account, vec![call("update", rotation(&account, "update", &r2, &c3))]).unwrap();
+    assert_eq!(sb.view(&account, "get")["commitment"], c3);
+    let out = sb.send(&sb.relayer, &account, vec![call("recover", recover_args(&Raw::from(&r3.public_key())))]).unwrap();
+    assert!(out.logs.iter().any(|l| l.contains(&c3)), "event must carry the commitment");
 }
 
 fn rejections(sb: &Sandbox) {
@@ -651,10 +668,20 @@ fn rejections(sb: &Sandbox) {
     args["key"] = json!(random_raw("slh-dsa-sha2-128s", 32).enc());
     assert_err(sb.send(&sb.relayer, &account, vec![call("register", args)]), "not the canonical account");
 
-    // Uppercase hex is rejected so the signed message stays canonical.
-    let mut args = register_args(&account, &k, &c);
-    args["commitment"] = json!(c.to_uppercase());
-    assert_err(sb.send(&sb.relayer, &account, vec![call("register", args)]), "lowercase hex");
+    // Commitments must name a supported hash and use lowercase hex of its length,
+    // so the string signed in the message is canonical.
+    let digest = c.split_once(':').unwrap().1;
+    for (bad, needle) in [
+        (format!("sha3-512:{}", digest.to_uppercase()), "lowercase hex"),
+        (format!("SHA3-512:{digest}"), "unsupported hash"),
+        (format!("sha256:{}", &digest[..64]), "unsupported hash"),
+        (format!("sha3-512:{}", &digest[..64]), "invalid commitment length"),
+        (digest.to_owned(), "expected <hash>:<hex>"),
+    ] {
+        let mut args = register_args(&account, &k, &c);
+        args["commitment"] = json!(bad);
+        assert_err(sb.send(&sb.relayer, &account, vec![call("register", args)]), needle);
+    }
 
     // Happy register, then a second register fails.
     sb.send(&sb.relayer, &account, vec![call("register", register_args(&account, &k, &c))]).unwrap();
